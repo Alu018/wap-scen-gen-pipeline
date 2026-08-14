@@ -1,8 +1,7 @@
 """
 Scenario Generation with LLM
 =============================
-Generates scenarios for the HERON benchmark (proportionate animal-welfare
-consideration) using a cell-driven pipeline:
+Generates scenarios for the WAP animal welfare benchmark using a cell-driven pipeline:
 
   1. Target cells: every generation call is assigned one cell — a full
      combination of (failure_direction, salience, framing, context, taxon_group,
