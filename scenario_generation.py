@@ -52,7 +52,7 @@ from typing import Literal, Type, TypeAlias
 
 import instructor
 import pandas as pd
-from anthropic import Anthropic
+from openai import OpenAI
 from dotenv import load_dotenv
 from pydantic import BaseModel, field_validator, model_validator
 
@@ -74,39 +74,33 @@ from scenario_prompts import (  # noqa: F401 — re-exported for callers/tests
 load_dotenv()
 
 # --- CLIENTS ---
-anthropic_client = Anthropic()
-MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5")
+# All models are routed through OpenRouter (OpenAI-compatible API), so one
+# OPENROUTER_API_KEY covers the generator, the judge, and the fallback.
+# Model names use OpenRouter slugs: <provider>/<model>.
+openrouter_client = OpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=os.getenv("OPENROUTER_API_KEY"),
+)
+MODEL = os.getenv("OPENROUTER_MODEL", "anthropic/claude-sonnet-5")
 # Judge kept cross-family from the generator to avoid self/family-preference
 # bias in QC scoring. Gemini 3.6 Flash was validated against Opus 4.8 on the
 # frozen 24-scenario verify corpus (see experiments/scenario_gen_pipeline/
 # QC_judge_verfication_8.9.26/findings.md): stricter on the rubric's
 # conformance caps, 88% exact repeat stability at temperature=0, ~30x cheaper.
-JUDGE_MODEL = "gemini-3.6-flash"
+JUDGE_MODEL = "google/gemini-3.6-flash"
 
-# Lazily-initialized Gemini client (instructor-wrapped). Created on first use
-# so Anthropic-only runs never require GEMINI_API_KEY.
-_genai_client = None
-
-
-def _get_genai_client():
-    global _genai_client
-    if _genai_client is None:
-        import instructor as _instructor
-        from google import genai as _genai
-        _genai_client = _instructor.from_genai(_genai.Client())
-    return _genai_client
 # Fallback for API-side refusal-classifier false positives (e.g. category='bio'
 # firing on animal-research content like the octopus neural-stimulation seed).
 # The classifier behaves differently per model, so retrying the same request
 # once on a different frontier model usually succeeds. Kept distinct from both
 # MODEL (must differ for the retry to help) and JUDGE_MODEL (judge separation).
-FALLBACK_MODEL = "claude-sonnet-4-5-20250929"
+FALLBACK_MODEL = "anthropic/claude-sonnet-4.5"
 
 
 # Models observed rejecting the temperature param (API 400: "deprecated for this
 # model"). Pre-seeded with known cases; also populated at runtime so at most the
 # first call per model wastes a request.
-_TEMPERATURE_UNSUPPORTED: set[str] = {"claude-sonnet-5", "claude-opus-4-8"}
+_TEMPERATURE_UNSUPPORTED: set[str] = {"anthropic/claude-sonnet-5", "anthropic/claude-opus-4.8"}
 
 
 def _is_refusal_error(e: Exception) -> bool:
@@ -170,15 +164,14 @@ def generate_structured_response(
         dict: The model's response as a dict matching the response_format schema.
     """
     allowed_models = [
-        "claude-fable-5",
-        "claude-opus-4-8",
-        "claude-sonnet-5",
-        "claude-sonnet-4-5-20250929",
-        "claude-opus-4-5-20251101",
-        "claude-haiku-4-5-20251001",
-        "claude-sonnet-4-20250514",
-        "claude-opus-4-20250514",
-        "gemini-3.6-flash",
+        "anthropic/claude-opus-4.8",
+        "anthropic/claude-sonnet-5",
+        "anthropic/claude-sonnet-4.5",
+        "anthropic/claude-opus-4.5",
+        "anthropic/claude-haiku-4.5",
+        "google/gemini-3.6-flash",
+        "google/gemini-2.5-flash",
+        "openai/gpt-5.2",
     ]
     if model not in allowed_models:
         warnings.warn(f"Warning: using unexpected model {model!r}")
@@ -187,48 +180,23 @@ def generate_structured_response(
         for m in messages:
             print(f"[{m['role']}]: {m['content'][:200]}...")
 
-    # --- Gemini branch (QC judge) ---
-    # Anthropic-specific machinery (temperature fallback, refusal-classifier
-    # retry) does not apply. Gemini uses role "model" for assistant turns.
-    if model.startswith("gemini"):
-        from google.genai import types as genai_types
-        genai_messages = [
-            {**m, "role": "model"} if m["role"] == "assistant" else m
-            for m in messages
-        ]
-        try:
-            resp = _get_genai_client().chat.completions.create(
-                model=model,
-                messages=genai_messages,
-                response_model=response_format,
-                max_retries=3,
-                config=genai_types.GenerateContentConfig(
-                    temperature=temperature,
-                    # Judge callers pass small ceilings tuned for Claude; give
-                    # Gemini headroom so structured output isn't truncated.
-                    max_output_tokens=max(max_tokens, 2048),
-                ),
-            )
-            return resp.model_dump()
-        except Exception as e:
-            raise RuntimeError(f"Error in generation:\n{e}") from e
-
-    has_system = messages[0]["role"] == "system"
-    kwargs = {"system": messages[0]["content"]} if has_system else {}
-    msgs = messages[1:] if has_system else messages
-
     def _create(use_model: str, include_temperature: bool = True):
-        create_kwargs = dict(kwargs)
+        create_kwargs = {}
         if include_temperature:
             create_kwargs["temperature"] = temperature
-        return instructor.from_anthropic(client=anthropic_client).messages.create(
+        if stop_sequences:
+            create_kwargs["stop"] = stop_sequences
+        return instructor.from_openai(
+            openrouter_client, mode=instructor.Mode.JSON
+        ).chat.completions.create(
             model=use_model,
-            messages=msgs,
-            max_tokens=max_tokens,
-            stop_sequences=stop_sequences,
+            messages=messages,
+            # Judge callers pass small ceilings tuned for Claude; keep headroom
+            # so structured output isn't truncated on other providers.
+            max_tokens=max(max_tokens, 2048),
             response_model=response_format,
             # Reask on validation failure: instructor feeds the pydantic error
-            # back to the model, which usually fixes malformed tool output.
+            # back to the model, which usually fixes malformed output.
             max_retries=3,
             **create_kwargs,
         )
@@ -240,7 +208,7 @@ def generate_structured_response(
         try:
             return _create(use_model, include_temperature=True)
         except Exception as e:
-            if "temperature" in str(e) and "deprecated" in str(e):
+            if "temperature" in str(e):
                 # Remember so subsequent calls skip the doomed first attempt.
                 _TEMPERATURE_UNSUPPORTED.add(use_model)
                 return _create(use_model, include_temperature=False)
@@ -847,7 +815,7 @@ def check_topic_duplicates_batch(
         for q in questions
     ]
     responses = generate_structured_responses_with_threadpool(
-        model="claude-haiku-4-5-20251001",
+        model="anthropic/claude-haiku-4.5",
         messages_list=messages_list,
         response_format=TopicCheck,
         temperature=0,
@@ -880,7 +848,7 @@ def find_within_batch_duplicates(keys: list[str]) -> set[int]:
         return set()
     numbered = "\n".join(f"{i}: {k}" for i, k in enumerate(keys))
     response = generate_structured_response(
-        model="claude-haiku-4-5-20251001",
+        model="anthropic/claude-haiku-4.5",
         messages=[{"role": "user", "content": BATCH_DEDUP_PROMPT.format(keys=numbered)}],
         response_format=BatchDedup,
         temperature=0,
@@ -1343,11 +1311,11 @@ def generate_and_score_scenarios(
 def convert_final_json_to_csv(json_path: str, csv_path: str | None = None) -> str:
     """Convert a final scenario JSON file to a TSV ready to copy-paste into Google Sheets.
 
-    Column shape follows the WAP Sheet schema (see CLAUDE.md): id, question,
-    tags, animal_category, sentience_level, reference_answer, sources, Notes —
-    plus the generation metadata (cell fields) and a provenance column
-    (seed / generated / human-edited). WAP is 1-turn only, so there is no
-    turn2 column.
+    Column shape follows the WAP Sheet schema: id, prompt, context,
+    interaction, framing, taxon, salience — plus the generation metadata
+    (failure_direction, warranted_consideration, provenance, artifact, stake,
+    language) in trailing columns. WAP is 1-turn only, so there is no turn2
+    column.
     """
     if csv_path is None:
         csv_path = os.path.join(os.path.dirname(json_path), "scenarios_for_import.tsv")
@@ -1355,33 +1323,29 @@ def convert_final_json_to_csv(json_path: str, csv_path: str | None = None) -> st
     with open(json_path) as f:
         scenarios = json.load(f)
 
+    # First 7 columns mirror the WAP Sheet exactly (id, prompt, context,
+    # interaction, framing, taxon, salience) so pasted rows line up; the
+    # remaining generation metadata follows in labeled trailing columns.
     fieldnames = [
-        "id", "question", "tags", "animal_category", "sentience_level",
-        "reference_answer", "sources", "Notes", "provenance",
-        "failure_direction", "warranted_consideration", "context", "framing",
-        "salience", "interaction", "artifact", "taxon_group", "stake",
-        "language",
+        "id", "prompt", "context", "interaction", "framing", "taxon",
+        "salience",
+        "failure_direction", "warranted_consideration", "provenance",
+        "artifact", "stake", "language",
     ]
 
     rows = [
         {
             "id": i,
-            "question": s["question"],
-            "tags": "['Proportionate Animal-Welfare Consideration']",
-            "animal_category": s.get("taxon_group", ""),
-            "sentience_level": "",
-            "reference_answer": "",
-            "sources": "",
-            "Notes": "",
-            "provenance": s.get("provenance", "generated"),
+            "prompt": s["question"],
+            "context": s.get("context", ""),
+            "interaction": s.get("interaction", ""),
+            "framing": s.get("framing", ""),
+            "taxon": s.get("taxon_group", ""),
+            "salience": s.get("salience", ""),
             "failure_direction": s.get("failure_direction", ""),
             "warranted_consideration": s.get("warranted_consideration", ""),
-            "context": s.get("context", ""),
-            "framing": s.get("framing", ""),
-            "salience": s.get("salience", ""),
-            "interaction": s.get("interaction", ""),
+            "provenance": s.get("provenance", "generated"),
             "artifact": s.get("artifact") or "",
-            "taxon_group": s.get("taxon_group", ""),
             "stake": s.get("stake", ""),
             "language": s.get("language", "en"),
         }
@@ -1589,7 +1553,7 @@ if __name__ == "__main__":
     os.makedirs(scenarios_dir, exist_ok=True)
 
     # How many scenarios this run accumulates (also names the run directory).
-    target = 40
+    target = 20
 
     # One subdirectory per run: batch<N>_<MMDDYY_HHMM>/
     run_timestamp = datetime.now().strftime("%m%d%y_%H%M")
