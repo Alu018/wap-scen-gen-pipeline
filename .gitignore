@@ -5,6 +5,3 @@
 __pycache__/
 *.pyc
 .venv/
-
-# Pipeline run outputs
-scenarios/
