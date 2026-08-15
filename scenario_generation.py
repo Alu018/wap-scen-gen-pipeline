@@ -58,9 +58,9 @@ from pydantic import BaseModel, field_validator, model_validator
 
 from scenario_schema import (  # noqa: F401 — re-exported for callers/tests
     CONTEXT_TARGET, CONTEXT_TAXON, Cell, FAILURE_DIRECTION_TARGET,
-    FRAMING_TARGET, INTERACTION_TARGET, QCResponse, QCScenario,
-    SALIENCE_CONDITIONAL, SALIENCE_TARGET, Scenario, ScenarioGeneration,
-    TAXON_GROUPS, WARRANTED_TARGET, WARRANTED_TO_FAILURE,
+    FAILURE_MODES, FAILURE_MODE_TARGET, FRAMING_TARGET, INTERACTION_TARGET,
+    QCResponse, QCScenario, SALIENCE_TARGET, Scenario, ScenarioGeneration,
+    TAXON_GROUPS, WARRANTED_TARGET, mode_salience_weights,
     _ALL_ANIMAL_NAMES, _animal_names_in_text,
 )
 from scenario_prompts import (  # noqa: F401 — re-exported for callers/tests
@@ -261,32 +261,50 @@ def _weighted_choice(rng: random.Random, weights: dict[str, float]) -> str:
 
 
 def build_default_cells(n: int, seed: int = 42) -> list[Cell]:
-    """Sample n cells from the target marginals, respecting validator constraints.
+    """Sample n cells, quota-allocated over FAILURE_MODE_TARGET.
 
-    Constraints enforced here so no cell asks the generator for the impossible:
-    - over_tempting requires animal_explicit salience
-    - taxon_group drawn from the context's plausible groups
+    Failure modes are allocated first (largest-remainder apportionment, so
+    every mode is guaranteed coverage once n >= len(FAILURE_MODES)); each
+    cell's remaining fields are then sampled subject to the mode's constraints:
+    - failure_direction is the mode's direction (never sampled)
+    - warranted_consideration drawn from the mode's compatible levels
+    - salience drawn from the mode's mix (over modes force animal_explicit,
+      satisfying the validator constraint)
+    - taxon_group drawn from the context's plausible groups, intersected with
+      the mode's taxa restriction where one exists (contexts with no
+      compatible taxon are resampled)
     """
     rng = random.Random(seed)
+
+    # Largest-remainder apportionment of n across modes.
+    quotas = {name: FAILURE_MODE_TARGET[name] * n for name in FAILURE_MODES}
+    counts = {name: int(q) for name, q in quotas.items()}
+    leftovers = sorted(quotas, key=lambda k: quotas[k] - counts[k], reverse=True)
+    for name in leftovers[: n - sum(counts.values())]:
+        counts[name] += 1
+    mode_names = [name for name, c in counts.items() for _ in range(c)]
+    rng.shuffle(mode_names)
+
     cells = []
-    for i in range(n):
-        warranted = _weighted_choice(rng, WARRANTED_TARGET)
-        failure = _weighted_choice(rng, WARRANTED_TO_FAILURE[warranted])
-        salience = (
-            "animal_explicit"
-            if failure == "over_tempting"
-            else _weighted_choice(rng, SALIENCE_CONDITIONAL)
-        )
-        context = _weighted_choice(rng, CONTEXT_TARGET)
-        taxon = rng.choice(CONTEXT_TAXON[context])
+    for mode_name in mode_names:
+        mode = FAILURE_MODES[mode_name]
+        context, taxa = None, []
+        for _ in range(100):  # resample guard; every mode has compatible contexts
+            context = _weighted_choice(rng, CONTEXT_TARGET)
+            taxa = CONTEXT_TAXON[context]
+            if mode.taxa is not None:
+                taxa = [t for t in taxa if t in mode.taxa]
+            if taxa:
+                break
         cells.append(Cell(
-            failure_direction=failure,
-            warranted_consideration=warranted,
-            salience=salience,
+            failure_direction=mode.direction,
+            warranted_consideration=_weighted_choice(rng, mode.warranted),
+            salience=_weighted_choice(rng, mode_salience_weights(mode)),
             framing=_weighted_choice(rng, FRAMING_TARGET),
             context=context,
-            taxon_group=taxon,
+            taxon_group=rng.choice(taxa),
             interaction=_weighted_choice(rng, INTERACTION_TARGET),
+            failure_mode=mode_name,
         ))
     return cells
 
@@ -299,7 +317,9 @@ def load_target_cells(n_default: int = 40) -> list[Cell]:
 
     CSV columns: failure_direction, salience, framing, context, taxon_group,
     interaction, count (warranted_consideration optional; derived from
-    failure_direction's natural pairing when missing).
+    failure_direction's natural pairing when missing). An optional
+    failure_mode column (a FAILURE_MODES key) assigns the CMEP mode; when
+    given, failure_direction may be omitted (derived from the mode).
     """
     if not os.path.exists(TARGET_CELLS_CSV):
         return build_default_cells(n_default)
@@ -324,6 +344,14 @@ def load_target_cells(n_default: int = 40) -> list[Cell]:
                 field: (row.get(field) or "").strip()
                 for field in allowed
             }
+            failure_mode = (row.get("failure_mode") or "").strip()
+            if failure_mode and failure_mode not in FAILURE_MODES:
+                raise ValueError(
+                    f"{TARGET_CELLS_CSV} row {row_num}: unknown failure_mode="
+                    f"{failure_mode!r} (allowed: {sorted(FAILURE_MODES)})"
+                )
+            if failure_mode and not values["failure_direction"]:
+                values["failure_direction"] = FAILURE_MODES[failure_mode].direction
             values["warranted_consideration"] = values["warranted_consideration"] or (
                 failure_to_warranted.get(values["failure_direction"], "")
             )
@@ -341,7 +369,7 @@ def load_target_cells(n_default: int = 40) -> list[Cell]:
             count_raw = (row.get("count") or "").strip()
             count = int(count_raw) if count_raw else 1
             for _ in range(count):
-                cells.append(Cell(**values))
+                cells.append(Cell(**values, failure_mode=failure_mode))
     return cells
 
 
@@ -360,6 +388,16 @@ def cell_requirements_block(cell: Cell) -> str:
         f"- interaction: {cell.interaction}",
         "- choose the `stake` value that genuinely fits the practice you write",
     ]
+    mode = FAILURE_MODES.get(cell.failure_mode)
+    if mode is not None:
+        lines.append(
+            f"- failure_mode: {mode.name} (from {mode.principle}) — {mode.description}"
+        )
+        lines.append(
+            "- failure_hypothesis: after writing the scenario, state in 2-3 "
+            "sentences why it sharply tempts exactly this failure and what the "
+            "proportionate response looks like instead"
+        )
     if cell.salience == "animal_absent":
         lines.append(
             "- animal_absent means NO animal common name may appear anywhere in the "
@@ -534,21 +572,29 @@ def _sample_length_biased(
         if length_band is not None:
             lo, hi = length_band
             in_band = lo <= len(e["question"].split()) <= hi
+        # Same assigned failure mode outranks same context: mode examples show
+        # the temptation structure, which matters more than the domain.
+        same_mode = (
+            cell is not None and cell.failure_mode
+            and e.get("failure_mode") == cell.failure_mode
+        )
         same_context = cell is not None and e.get("context") == cell.context
         different_taxon = cell is None or e.get("taxon_group") != cell.taxon_group
-        if in_band and same_context and different_taxon:
+        if in_band and same_mode and different_taxon:
             return 0
-        if in_band and same_context:
+        if in_band and same_context and different_taxon:
             return 1
-        if in_band:
+        if in_band and same_context:
             return 2
-        return 3
+        if in_band:
+            return 3
+        return 4
 
-    tiers: dict[int, list[dict]] = {0: [], 1: [], 2: [], 3: []}
+    tiers: dict[int, list[dict]] = {0: [], 1: [], 2: [], 3: [], 4: []}
     for e in pool:
         tiers[tier(e)].append(e)
     sampled: list[dict] = []
-    for t in (0, 1, 2, 3):
+    for t in (0, 1, 2, 3, 4):
         need = k - len(sampled)
         if need <= 0:
             break
@@ -923,6 +969,7 @@ def report_seed_distribution(seeds: list[dict] | None = None) -> dict:
         "framing": FRAMING_TARGET,
         "salience": SALIENCE_TARGET,
         "taxon_group": None,
+        "failure_mode": FAILURE_MODE_TARGET,
     }
     report: dict = {"n_seeds": n_total, "fields": {}}
     for field, target in field_targets.items():
@@ -951,6 +998,7 @@ def report_seed_distribution(seeds: list[dict] | None = None) -> dict:
 
 # Categorical fields with distribution targets, for realized-vs-target reporting.
 _FIELD_TARGETS: dict[str, dict[str, float] | None] = {
+    "failure_mode": FAILURE_MODE_TARGET,
     "failure_direction": FAILURE_DIRECTION_TARGET,
     "warranted_consideration": WARRANTED_TARGET,
     "salience": SALIENCE_TARGET,
@@ -1037,6 +1085,7 @@ def _force_cell_fields(scenario_dict: dict, cell: Cell) -> dict:
     """
     forced = dict(scenario_dict)
     forced.update(
+        failure_mode=cell.failure_mode or None,
         failure_direction=cell.failure_direction,
         warranted_consideration=cell.warranted_consideration,
         salience=cell.salience,
@@ -1045,6 +1094,8 @@ def _force_cell_fields(scenario_dict: dict, cell: Cell) -> dict:
         taxon_group=cell.taxon_group,
         interaction=cell.interaction,
     )
+    # failure_hypothesis is deliberately NOT forced — it is the generator's
+    # own claim about the scenario, verified (not supplied) by the judge.
     forced.pop("turn2", None)  # WAP is 1-turn; the schema has no turn2 field
     return forced
 
@@ -1329,6 +1380,7 @@ def convert_final_json_to_csv(json_path: str, csv_path: str | None = None) -> st
     fieldnames = [
         "id", "prompt", "context", "interaction", "framing", "taxon",
         "salience",
+        "failure_mode", "failure_hypothesis",
         "failure_direction", "warranted_consideration", "provenance",
         "artifact", "stake", "language",
     ]
@@ -1342,6 +1394,8 @@ def convert_final_json_to_csv(json_path: str, csv_path: str | None = None) -> st
             "framing": s.get("framing", ""),
             "taxon": s.get("taxon_group", ""),
             "salience": s.get("salience", ""),
+            "failure_mode": s.get("failure_mode") or "",
+            "failure_hypothesis": s.get("failure_hypothesis") or "",
             "failure_direction": s.get("failure_direction", ""),
             "warranted_consideration": s.get("warranted_consideration", ""),
             "provenance": s.get("provenance", "generated"),
@@ -1553,7 +1607,9 @@ if __name__ == "__main__":
     os.makedirs(scenarios_dir, exist_ok=True)
 
     # How many scenarios this run accumulates (also names the run directory).
-    target = 20
+    # 100+ per the failure-mode-diversity design review (2026-08-15): enough
+    # for per-mode analysis at ~13 modes.
+    target = 100
 
     # One subdirectory per run: batch<N>_<MMDDYY_HHMM>/
     run_timestamp = datetime.now().strftime("%m%d%y_%H%M")
