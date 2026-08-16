@@ -578,6 +578,5 @@ class Cell:
     taxon_group: str
     interaction: str
     # CMEP failure mode (key into FAILURE_MODES). Default "" keeps hand-built
-    # cells (e.g. legacy target_cells.csv rows) constructible; sampled cells
-    # always carry one.
+    # test cells constructible; sampled cells always carry one.
     failure_mode: str = ""
