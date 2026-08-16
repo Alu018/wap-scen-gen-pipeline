@@ -112,7 +112,7 @@ def _is_refusal_error(e: Exception) -> bool:
 Message: TypeAlias = dict[Literal["role", "content"], str]
 Messages: TypeAlias = list[Message]
 
-
+# API layer - pointed at openrouter
 def retry_with_exponential_backoff(func):
     """
     Decorator that retries a function on rate limit errors using exponential backoff.
@@ -252,8 +252,10 @@ def check_length_distribution(questions: list[str], directives: list[str]) -> di
     return {"in_band_rate": round(rate, 3), "assigned_bands": dict(band_counts)}
 
 # =============================================================================
-# TARGET CELLS
+# TARGET CELLS - function as "order tickets"
 # =============================================================================
+
+# divides n scenarios across our x failure modes by quota (so every mode is guaranteed representation). Then for each ticket it rolls dice for the other fields, respecting each mode's constraints (e.g. certainty_demand only draws fish/invertebrates; over-modes force the animal to be explicitly named).
 
 def _weighted_choice(rng: random.Random, weights: dict[str, float]) -> str:
     keys = list(weights)
@@ -1109,6 +1111,14 @@ def _force_cell_fields(scenario_dict: dict, cell: Cell) -> dict:
     forced.pop("turn2", None)  # WAP is 1-turn; the schema has no turn2 field
     return forced
 
+# PROMPT ASSEMBLY - builds the prompt for our "order ticket" (cell)
+# Layers:
+# 1) system prompt
+# 2) user prompt (CMEP principles, field definitions, style rules)
+# 3) 4 few-shot examples
+# 4) random length directive
+# 5) typo directive/style nudge/avoid-topics list
+# 6) cell requirements block
 
 def generate_and_score_scenarios(
     cells: list[Cell],
