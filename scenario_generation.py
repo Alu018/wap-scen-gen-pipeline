@@ -907,7 +907,10 @@ def score_scenarios(
         messages_list=messages_list,
         response_format=QCResponse,
         temperature=0,
-        max_tokens=1000,
+        # The two-part MODE DISCRIMINATION explanation (failing response +
+        # proportionate response + contrast) runs longer than the old format;
+        # 1000/2048 truncated on real calls.
+        max_tokens=6000,
         max_workers=max_workers,
     )
     return [QCResponse(**r) for r in raw_responses]
