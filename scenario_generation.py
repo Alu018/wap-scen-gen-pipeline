@@ -5,9 +5,9 @@ Generates candidate Turn-1 scenarios for the WAP benchmark (proportionate
 animal-welfare consideration). The flow, per batch:
 
   1. CELLS: sample "order tickets" from the target distributions in
-     scenario_schema.py (or load exact ones from dataset/target_cells.csv) —
-     each ticket fixes context, framing, salience, interaction, taxon group,
-     warranted level, and failure direction for one scenario.
+     scenario_schema.py — each ticket fixes the failure mode, context, framing,
+     salience, interaction, taxon group, warranted level, and failure
+     direction for one scenario.
   2. GENERATE: one Claude call per cell. The prompt combines the instructions
      in scenario_prompts.py, few-shot examples drawn from the hand-written
      seeds in wap_prompts.csv (length- and cell-matched), a sampled
@@ -64,7 +64,8 @@ from scenario_schema import (  # noqa: F401 — re-exported for callers/tests
     _ALL_ANIMAL_NAMES, _animal_names_in_text,
 )
 from scenario_prompts import (  # noqa: F401 — re-exported for callers/tests
-    LENGTH_DIRECTIVES, MAX_SCENARIO_WORDS, REPAIR_PROMPT, RUBRIC,
+    CMEP_PRINCIPLES_SUMMARY, LENGTH_DIRECTIVES, MAX_SCENARIO_WORDS,
+    REPAIR_PROMPT, RUBRIC,
     SCORING_EXAMPLES, SYSTEM_PROMPT,
     TYPO_DIRECTIVES, USER_PROMPT, VAR_PROMPTS, _ld_bands, _ld_options,
     _ld_weights, _td_options, _td_weights, evaluation_definition,
@@ -112,7 +113,7 @@ def _is_refusal_error(e: Exception) -> bool:
 Message: TypeAlias = dict[Literal["role", "content"], str]
 Messages: TypeAlias = list[Message]
 
-
+# API layer - pointed at openrouter
 def retry_with_exponential_backoff(func):
     """
     Decorator that retries a function on rate limit errors using exponential backoff.
@@ -252,8 +253,10 @@ def check_length_distribution(questions: list[str], directives: list[str]) -> di
     return {"in_band_rate": round(rate, 3), "assigned_bands": dict(band_counts)}
 
 # =============================================================================
-# TARGET CELLS
+# TARGET CELLS - function as "order tickets"
 # =============================================================================
+
+# divides n scenarios across our x failure modes by quota (so every mode is guaranteed representation). Then for each ticket it rolls dice for the other fields, respecting each mode's constraints (e.g. certainty_demand only draws fish/invertebrates; over-modes force the animal to be explicitly named).
 
 def _weighted_choice(rng: random.Random, weights: dict[str, float]) -> str:
     keys = list(weights)
@@ -306,70 +309,6 @@ def build_default_cells(n: int, seed: int = 42) -> list[Cell]:
             interaction=_weighted_choice(rng, INTERACTION_TARGET),
             failure_mode=mode_name,
         ))
-    return cells
-
-
-TARGET_CELLS_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "target_cells.csv")
-
-
-def load_target_cells(n_default: int = 40) -> list[Cell]:
-    """Load cells from dataset/target_cells.csv if present, else sample defaults.
-
-    CSV columns: failure_direction, salience, framing, context, taxon_group,
-    interaction, count (warranted_consideration optional; derived from
-    failure_direction's natural pairing when missing). An optional
-    failure_mode column (a FAILURE_MODES key) assigns the CMEP mode; when
-    given, failure_direction may be omitted (derived from the mode).
-    """
-    if not os.path.exists(TARGET_CELLS_CSV):
-        return build_default_cells(n_default)
-    failure_to_warranted = {"over_tempting": "none", "balanced": "brief", "under_tempting": "substantial"}
-    # Allowed values per field, taken from the Scenario schema so the CSV can't
-    # drift from it. A bad row is rejected up front with its row number —
-    # otherwise an impossible cell (e.g. over_tempting x incidental) would make
-    # every generation for it fail validation, retried forever by Step 3.
-    allowed = {
-        "failure_direction": set(failure_to_warranted),
-        "warranted_consideration": {"none", "brief", "considerable", "substantial"},
-        "salience": {"animal_explicit", "animal_incidental", "animal_absent"},
-        "framing": {"personal", "work"},
-        "context": set(CONTEXT_TARGET),
-        "taxon_group": set(TAXON_GROUPS),
-        "interaction": {"asking", "doing", "expressing"},
-    }
-    cells = []
-    with open(TARGET_CELLS_CSV, newline="") as f:
-        for row_num, row in enumerate(csv.DictReader(f), start=2):  # 1-based + header
-            values = {
-                field: (row.get(field) or "").strip()
-                for field in allowed
-            }
-            failure_mode = (row.get("failure_mode") or "").strip()
-            if failure_mode and failure_mode not in FAILURE_MODES:
-                raise ValueError(
-                    f"{TARGET_CELLS_CSV} row {row_num}: unknown failure_mode="
-                    f"{failure_mode!r} (allowed: {sorted(FAILURE_MODES)})"
-                )
-            if failure_mode and not values["failure_direction"]:
-                values["failure_direction"] = FAILURE_MODES[failure_mode].direction
-            values["warranted_consideration"] = values["warranted_consideration"] or (
-                failure_to_warranted.get(values["failure_direction"], "")
-            )
-            for field, value in values.items():
-                if value not in allowed[field]:
-                    raise ValueError(
-                        f"{TARGET_CELLS_CSV} row {row_num}: invalid {field}={value!r} "
-                        f"(allowed: {sorted(allowed[field])})"
-                    )
-            if values["failure_direction"] == "over_tempting" and values["salience"] != "animal_explicit":
-                raise ValueError(
-                    f"{TARGET_CELLS_CSV} row {row_num}: over_tempting requires "
-                    f"salience=animal_explicit, got {values['salience']!r}"
-                )
-            count_raw = (row.get("count") or "").strip()
-            count = int(count_raw) if count_raw else 1
-            for _ in range(count):
-                cells.append(Cell(**values, failure_mode=failure_mode))
     return cells
 
 
@@ -930,7 +869,18 @@ def build_scoring_messages(
     for ex in scoring_examples:
         messages.append({"role": "user", "content": ex.scenario.model_dump_json()})
         messages.append({"role": "assistant", "content": ex.response.model_dump_json()})
-    messages.append({"role": "user", "content": json.dumps(scenario_dict)})
+    # Anchor the judge to the same construct the generator saw: the condensed
+    # CMEP principles plus the assigned mode's full definition. Without this
+    # the judge only sees the mode's NAME and grades against its own gloss.
+    final = json.dumps(scenario_dict)
+    mode = FAILURE_MODES.get(scenario_dict.get("failure_mode") or "")
+    if mode is not None:
+        final += (
+            "\n\n" + CMEP_PRINCIPLES_SUMMARY
+            + f"\n\nASSIGNED FAILURE MODE, DEFINED: {mode.name} "
+            f"(from {mode.principle}) — {mode.description}"
+        )
+    messages.append({"role": "user", "content": final})
     return messages
 
 
@@ -957,7 +907,10 @@ def score_scenarios(
         messages_list=messages_list,
         response_format=QCResponse,
         temperature=0,
-        max_tokens=1000,
+        # The two-part MODE DISCRIMINATION explanation (failing response +
+        # proportionate response + contrast) runs longer than the old format;
+        # 1000/2048 truncated on real calls.
+        max_tokens=6000,
         max_workers=max_workers,
     )
     return [QCResponse(**r) for r in raw_responses]
@@ -1109,6 +1062,14 @@ def _force_cell_fields(scenario_dict: dict, cell: Cell) -> dict:
     forced.pop("turn2", None)  # WAP is 1-turn; the schema has no turn2 field
     return forced
 
+# PROMPT ASSEMBLY - builds the prompt for our "order ticket" (cell)
+# Layers:
+# 1) system prompt
+# 2) user prompt (CMEP principles, field definitions, style rules)
+# 3) 4 few-shot examples
+# 4) random length directive
+# 5) typo directive/style nudge/avoid-topics list
+# 6) cell requirements block
 
 def generate_and_score_scenarios(
     cells: list[Cell],
@@ -1485,7 +1446,7 @@ _STYLE_BANNED_PHRASES = [
 ]
 
 
-def run_verification(n: int = 24, out_dir: str = "", use_cells_csv: bool = False) -> list[QCScenario]:
+def run_verification(n: int = 24, out_dir: str = "") -> list[QCScenario]:
     """Generate ~n scenarios across distinct cells and print the Stage-7 report:
 
     1. Realized vs. target on every categorical field
@@ -1497,15 +1458,10 @@ def run_verification(n: int = 24, out_dir: str = "", use_cells_csv: bool = False
     7. Near-duplicates found and removed
     8. QC score distribution and validator failures
     """
-    if use_cells_csv:
-        # Aim the diagnostic run at hand-written cells (dataset/target_cells.csv)
-        # instead of dice — for exercising rare arms deliberately.
-        cells = load_target_cells(n_default=n)
-    else:
-        cells = build_default_cells(n, seed=7)
+    cells = build_default_cells(n, seed=7)
     n_distinct = len(set(cells))
     print(f"=== VERIFICATION RUN: {len(cells)} scenarios across {n_distinct} distinct cells ===")
-    if not use_cells_csv and n_distinct < 8:
+    if n_distinct < 8:
         warnings.warn(f"Only {n_distinct} distinct cells sampled — spec asks for >= 8.")
 
     dataset = generate_and_score_scenarios(
@@ -1588,7 +1544,6 @@ if __name__ == "__main__":
     parser.add_argument("--score-bulk", metavar="JSON_PATH", help="Run the rubric judge over an existing scenario JSON and exit")
     parser.add_argument("--min-score", type=int, default=None, help="With --score-bulk: also write a filtered JSON+TSV of scenarios scoring >= this")
     parser.add_argument("--verify", action="store_true", help="Stage-7 verification run (~24 scenarios across >=8 cells) and exit")
-    parser.add_argument("--verify-cells", action="store_true", help="With --verify: use hand-written dataset/target_cells.csv instead of dice")
     parser.add_argument("--verify-n", type=int, default=24, help="Number of scenarios for --verify (default: 24)")
     parser.add_argument("--seed-report", action="store_true", help="Print the seed dataset's label mix vs generation targets and exit (no API calls)")
     args = parser.parse_args()
@@ -1610,7 +1565,7 @@ if __name__ == "__main__":
         verify_dir = os.path.join(os.path.dirname(__file__), "scenarios",
                                   f"verify_{datetime.now().strftime('%m%d%y_%H%M')}")
         os.makedirs(verify_dir, exist_ok=True)
-        run_verification(n=args.verify_n, out_dir=verify_dir, use_cells_csv=args.verify_cells)
+        run_verification(n=args.verify_n, out_dir=verify_dir)
         sys.exit(0)
 
     scenarios_dir = os.path.join(os.path.dirname(__file__), "scenarios")
@@ -1681,9 +1636,9 @@ if __name__ == "__main__":
     batch_version = 0
     empty_batches = 0
     checkpoint_path = os.path.join(run_dir, "step2_checkpoint.json")
-    # dataset/target_cells.csv (if present) defines the run's cells; shortfall
-    # batches after filtering losses draw fresh default cells.
-    pending_cells = load_target_cells(n_default=target)
+    # Quota-sampled cells for the whole run; shortfall batches after filtering
+    # losses draw fresh default cells inside the loop.
+    pending_cells = build_default_cells(target)
 
     while len(final_dataset) < target:
         n_before = len(final_dataset)
