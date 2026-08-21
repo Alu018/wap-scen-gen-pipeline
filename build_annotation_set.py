@@ -55,6 +55,7 @@ MODES = [
     "missing_note_or_alternative",
     "higher_harm_default",
     "scale_blindness",
+    "sentience_misstatement",
 ]
 N_PER_MODE = 6
 
