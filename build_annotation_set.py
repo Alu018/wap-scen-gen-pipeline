@@ -54,6 +54,7 @@ MODES = [
     "severity_blindness",
     "missing_note_or_alternative",
     "higher_harm_default",
+    "scale_blindness",
 ]
 N_PER_MODE = 6
 
