@@ -21,13 +21,9 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from build_annotation_set import openrouter_client  # noqa: E402  (.env + OPENROUTER_API_KEY)
+from scenario_generation import BENCHMARK_MODELS, openrouter_client  # noqa: E402  (.env + OPENROUTER_API_KEY)
 
-MODELS = [
-    "google/gemini-3.1-pro-preview",
-    "anthropic/claude-sonnet-5",
-    "openai/gpt-5.6-terra",
-]
+MODELS = BENCHMARK_MODELS
 MAX_TOKENS = 4000
 
 
