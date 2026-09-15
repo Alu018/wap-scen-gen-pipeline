@@ -8,3 +8,5 @@
 __pycache__/
 *.pyc
 .venv/
+# Hardness-probe response caches
+*_probe_cache.json
